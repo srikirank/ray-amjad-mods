@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-code-mods",
+  "name": "ray-amjad-mods",
   "owner": {
     "name": "Ray Amjad",
     "url": "https://github.com/ray-amjad"
