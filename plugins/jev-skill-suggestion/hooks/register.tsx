@@ -12,6 +12,11 @@ const SHORTLIST = 3
 const EXCERPT_CHARS = 700
 const GATE_THRESHOLD = 0.3
 const FITS_THRESHOLD = 0.3
+// A plugin only narrows the listing when Jev picks it this confidently.
+const PLUGIN_THRESHOLD = 0.3
+const PLUGIN_SKILL_CHARS = 160
+const PLUGIN_CRITERION_CHARS = 400
+const NO_PLUGIN = 'none_of_these'
 const DEBOUNCE_MS = 600
 const MIN_CHARS = 8
 const PANE = 'jev-skill-suggestion'
@@ -54,7 +59,14 @@ export function parseSkillMd(text: string, fallbackName: string): Skill | null {
     return unquote(parts.join(' '))
   }
   const name = field('name') || fallbackName
-  return { name, description: field('description'), body: (match[2] ?? '').trim().slice(0, EXCERPT_CHARS) }
+  return { name, description: field('description'), body: (match[2] ?? '').trim().slice(0, EXCERPT_CHARS), plugin: '' }
+}
+
+// The plugin a listing entry belongs to: the text before its first colon.
+// `acs:learn-next` is a skill of plugin `acs`; `dataviz` belongs to none.
+export function pluginOf(name: string): string {
+  const at = name.indexOf(':')
+  return at === -1 ? '' : name.slice(0, at)
 }
 
 // The engine's skill listing: `- name: description` per skill, a description
@@ -65,7 +77,9 @@ export function parseListing(text: string): Skill[] {
     const entry = line.match(/^- (\S+?)(?:: (.*))?$/)
     const last = skills[skills.length - 1]
     if (entry?.[1]) {
-      skills.push({ name: entry[1].replace(/:$/, ''), description: entry[2] ?? '', body: '' })
+      // The name stays fully qualified: that is what the model passes back.
+      const name = entry[1].replace(/:$/, '')
+      skills.push({ name, description: entry[2] ?? '', body: '', plugin: pluginOf(name) })
     } else if (last && line.trim() && !line.startsWith('The following')) {
       last.description += ` ${line.trim()}`
     }
@@ -74,14 +88,36 @@ export function parseListing(text: string): Skill[] {
 }
 
 // Disk skills bring their SKILL.md body; the listing brings the plugin and
-// built-in ones the disk scan cannot see. The listing decides who exists.
+// built-in ones the disk scan cannot see. The listing decides who exists, and
+// it alone carries the plugin: a disk copy never overwrites it with ''.
 export function mergeRoster(disk: Skill[], listed: Skill[]): Skill[] {
   if (listed.length === 0) return disk
   const byName = new Map(disk.map(skill => [skill.name, skill]))
   return listed.map(skill => {
     const local = byName.get(skill.name)
-    return local ? { ...skill, description: local.description || skill.description, body: local.body } : skill
+    return local
+      ? { ...skill, description: local.description || skill.description, body: local.body, plugin: skill.plugin }
+      : skill
   })
+}
+
+// The listing as the model reads it, with only the named plugins' entries left
+// in. Every non-entry line stays: the header, blank lines, and the continuation
+// lines of an entry that was kept. A dropped entry takes its own continuations
+// with it.
+export function narrowListing(text: string, relevant: readonly string[]): string {
+  const keep = new Set(relevant)
+  const kept: string[] = []
+  let state: 'kept' | 'dropped' | 'plain' = 'plain'
+  for (const line of text.split('\n')) {
+    // Read the entry's name the way parseListing does, so the set offered and
+    // the set loadable agree entry for entry.
+    const entry = line.match(/^- (\S+?)(?:: |$)/)
+    if (entry?.[1]) state = keep.has(pluginOf(entry[1].replace(/:$/, ''))) ? 'kept' : 'dropped'
+    else if (line.trim() === '') state = 'plain'
+    if (state !== 'dropped') kept.push(line)
+  }
+  return kept.join('\n')
 }
 
 export function gateOf(values: Record<string, number>): number {
@@ -94,8 +130,11 @@ const runtime: {
   asked: number
   disk: Skill[]
   listed: Skill[]
+  // The text of the last prompt submitted in steer mode whose verdict this
+  // session actually holds; '' whenever no verdict matches a live prompt.
+  submitted: string
   timer?: { cancel: () => void }
-} = { apiKey: '', asked: 0, disk: [], listed: [] }
+} = { apiKey: '', asked: 0, disk: [], listed: [], submitted: '' }
 
 async function ask($: Engine, state: unknown, questions: Record<string, unknown>) {
   const response = await $.http.fetch(API, {
@@ -115,8 +154,13 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
   const off = new Set(await read($, disabled))
   const skills = (await read($, roster)).filter(skill => !off.has(skill.name))
   const state = { request: text, recent_context: '' }
-  if (skills.length === 0) return { text, gate: 0, ranked: [], fits: {}, winner: null, ms: 0 }
+  if (skills.length === 0) {
+    return { text, gate: 0, ranked: [], fits: {}, winner: null, relevant: [], ms: 0 }
+  }
 
+  // Which plugins this session could narrow a listing to, and which skills
+  // each one brings: the criterion Jev reads instead of the plugin name.
+  const plugins = [...new Set(skills.map(skill => skill.plugin).filter(plugin => plugin !== ''))]
   const wideQuestions: Record<string, unknown> = {
     which: {
       type: 'choice',
@@ -124,10 +168,38 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
       criteria: Object.fromEntries(skills.map(skill => [skill.name, skill.description.slice(0, 250) || skill.name])),
     },
   }
+  if (plugins.length > 0) {
+    wideQuestions.plugins = {
+      type: 'choice',
+      instructions:
+        "Which of these plugins, if any, provides a skill needed for the user's latest request? Choose none_of_these if the request needs no plugin skill.",
+      criteria: {
+        ...Object.fromEntries(
+          plugins.map(plugin => [
+            plugin,
+            skills
+              .filter(skill => skill.plugin === plugin)
+              .map(skill => skill.description.slice(0, PLUGIN_SKILL_CHARS))
+              .join(' ')
+              .slice(0, PLUGIN_CRITERION_CHARS) || plugin,
+          ]),
+        ),
+        [NO_PLUGIN]: 'No plugin skill is needed for this request.',
+      },
+    }
+  }
   for (const [key, instructions] of Object.entries(GATE_QUESTIONS)) {
     wideQuestions[`gate::${key}`] = { type: 'noul', instructions }
   }
   const wide = await ask($, state, wideQuestions)
+  // Fail open: anything short of a confident pick of a known plugin leaves the
+  // listing alone and the guard on its old footing.
+  const pluginPick = wide.plugins?.choice
+  const relevant =
+    pluginPick && pluginPick !== NO_PLUGIN && plugins.includes(pluginPick) &&
+    (wide.plugins?.probabilities?.[pluginPick] ?? 0) >= PLUGIN_THRESHOLD
+      ? [pluginPick]
+      : []
   const ranked: Ranked[] = Object.entries(wide.which?.probabilities ?? {})
     .map(([name, probability]) => ({ name, probability }))
     .sort((a, b) => b.probability - a.probability)
@@ -144,6 +216,7 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
     ranked: ranked.slice(0, 12),
     fits,
     winner,
+    relevant,
     ms: (await $.clock.now()) - startedAt,
   })
   if (gate < GATE_THRESHOLD) return done({}, null)
@@ -171,6 +244,15 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
   )
   const best = Math.max(...Object.values(fits))
   return done(fits, best < FITS_THRESHOLD ? null : (narrow.which?.choice ?? null))
+}
+
+// The plugins a listing may be narrowed to, as both the listing and the guard
+// read them: those of the last submitted prompt's own verdict, and nothing
+// otherwise. An empty answer always means "do not narrow".
+const narrowing = async ($: Engine): Promise<string[]> => {
+  const result = await read($, verdict)
+  if (!runtime.submitted || result?.text !== runtime.submitted) return []
+  return result.relevant
 }
 
 // Scores the draft; a newer draft's answer wins, an older one is dropped.
@@ -274,9 +356,14 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     runtime.timer?.cancel()
     const text = e.text.trim()
-    if ((await read($, mode)) !== 'steer' || text.startsWith('/') || text.length < MIN_CHARS) return next(e)
+    if ((await read($, mode)) !== 'steer' || text.startsWith('/') || text.length < MIN_CHARS) {
+      // No verdict belongs to this prompt, so nothing may narrow against it.
+      runtime.submitted = ''
+      return next(e)
+    }
     const known = await read($, verdict)
     const result = known?.text === text ? known : await score($, text)
+    runtime.submitted = result?.text === text ? text : ''
     if (!result?.winner) return next(e)
     const note =
       `<skill_relevance>\nRelevant to the current request: ${result.winner}. ` +
@@ -284,12 +371,19 @@ export const register: Register = (on, options) => {
     return next({ ...e, context: [...(e.context ?? []), note] })
   })
 
-  // The listing the model reads: learn the roster from it, then hide it
-  // (block, steer) or drop the disabled skills from it (observe).
+  // The listing the model reads: learn the roster from it, then narrow it to
+  // Jev's plugins (steer), hide it (block) or drop the disabled skills
+  // (observe).
   on('prompt.attachment', { type: 'skill_listing' }, async ($, e, next) => {
     runtime.listed = parseListing(e.text)
     await update($, roster, () => mergeRoster(runtime.disk, runtime.listed))
     const current = await read($, mode)
+    if (current === 'steer') {
+      const relevant = await narrowing($)
+      // Fail open: no plugin named means the prompt stands as it did before.
+      if (relevant.length === 0) return next(e)
+      return next({ ...e, text: narrowListing(e.text, relevant) })
+    }
     if (current !== 'observe') return { text: null }
     const off = new Set(await read($, disabled))
     if (off.size === 0) return next(e)
@@ -304,7 +398,9 @@ export const register: Register = (on, options) => {
   })
 
   // The model's own skill loads: blocked outright, held to the steer pick,
-  // and never a disabled skill.
+  // and never a disabled skill. Steer's guard is the mirror of its listing: a
+  // skill in one of the plugins Jev named loads, anything else does not, so
+  // the model is never offered a skill it is about to be denied.
   on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
     const name = e.skill
     const current = await read($, mode)
@@ -315,6 +411,17 @@ export const register: Register = (on, options) => {
       return { deny: 'jev-skill-suggestion: skill loading is blocked in this session. Carry on without a skill.' }
     }
     if (current === 'steer') {
+      const relevant = await narrowing($)
+      if (relevant.length > 0) {
+        if (!relevant.includes(pluginOf(name))) {
+          return {
+            deny:
+              `jev-skill-suggestion: only skills of the plugins Jev named for this request may load ` +
+              `(${relevant.join(', ')}), and '${name}' is not one of them.`,
+          }
+        }
+        return next(e)
+      }
       const pick = (await read($, verdict))?.winner
       if (pick !== name) {
         return { deny: `jev-skill-suggestion: only the skill Jev picked for this request may load${pick ? ` (${pick})` : ' (none)'}.` }
@@ -346,7 +453,12 @@ export const register: Register = (on, options) => {
               {result && (
                 <Text>
                   {' '}· gate <Text bold>{result.gate.toFixed(2)}</Text> ·{' '}
-                  {result.winner ? (
+                  {current === 'steer' && result.relevant.length > 0 ? (
+                    <Text color="green">
+                      narrows to {result.relevant.join(', ')}
+                      {result.winner ? ` (pick ${result.winner})` : ''}
+                    </Text>
+                  ) : result.winner ? (
                     <Text color="green">
                       {current === 'block' ? 'would load' : current === 'steer' ? 'loads' : 'pick'} {result.winner}
                     </Text>
@@ -400,7 +512,8 @@ export const register: Register = (on, options) => {
           ))}
         </Box>
         <Text dimColor>
-          observe: Claude picks as usual · block: no skill loads · steer: only Jev's pick loads
+          observe: Claude picks as usual · block: no skill loads · steer: only the skills of the plugins Jev
+          names load, and only Jev's pick when it names none
         </Text>
         <Text dimColor>
           {skills.length} skills, {off.size} off{result ? ` · last: "${result.text.slice(0, 40)}"` : ''}
