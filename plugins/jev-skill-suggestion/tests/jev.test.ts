@@ -74,13 +74,21 @@ const PLUGGED = [
   '  from a right-hand pane.',
 ].join('\n')
 
-// What the module's own listing parse makes of PLUGGED, for the fail-open test
-// to compare a narrowed answer against.
+// PLUGGED narrowed to the acs plugin: what the narrowing test expects, and what
+// a narrowing that honours `disabled` leaves of it.
 const NARROWED_TO_ACS = [
   'The following skills are available:',
   '- acs:learn-next: Check watched videos',
   '  and suggest what to watch next.',
   '- acs:search: Search the school for videos.',
+].join('\n')
+
+// The same narrowing with acs:search ticked off in the pane: Jev still names
+// acs, so acs:learn-next is offered and its disabled sibling is not.
+const NARROWED_TO_ACS_MINUS_SEARCH = [
+  'The following skills are available:',
+  '- acs:learn-next: Check watched videos',
+  '  and suggest what to watch next.',
 ].join('\n')
 
 test('parses inline, folded and quoted descriptions', () => {
@@ -199,40 +207,51 @@ test("steer narrows the listing to the plugins Jev named, continuations and all"
   expect(attachment.text).toBe(NARROWED_TO_ACS)
 })
 
-test('steer with an empty relevant leaves the listing exactly as the unpatched mod did', async ($, on) => {
+test("a plugin's disabled skill is left out of steer's narrowed listing", async ($, on) => {
+  answerSubmit(on)
+  await start($, on, { mode: 'steer', disabled: ['acs:search'] }, { listing: PLUGGED, plugin: 'acs' })
+  await $.prompt.submit({ text: 'find me a video about postgres' } as never)
+  const attachment = await $.prompt.attachment({ type: 'skill_listing', text: PLUGGED } as never)
+  // The listing it was narrowed from carried acs:search, and Jev named acs, so
+  // only the disabled set can take its sibling out — as the guard does too.
+  expect(attachment.text).toBe(NARROWED_TO_ACS_MINUS_SEARCH)
+  expect((await $.tool.call({ tool: 'Skill', skill: 'acs:search' })).deny).toMatch(/turned off/)
+})
+
+test('steer with an empty relevant hides the listing, exactly as the unpatched mod did', async ($, on) => {
   answerSubmit(on)
   await start($, on, { mode: 'steer' }, { listing: PLUGGED, plugin: 'none_of_these' })
   await $.prompt.submit({ text: 'find me a video about postgres' } as never)
   const attachment = await $.prompt.attachment({ type: 'skill_listing', text: PLUGGED } as never)
-  expect(attachment.text).toBe(PLUGGED)
+  expect(attachment.text).toBe(null)
   // Jev named no plugin, so the guard keeps its old footing too.
   expect((await $.tool.call({ tool: 'Skill', skill: 'acs:search' })).deny).toMatch(/only the skill Jev picked/)
 })
 
-test('a plugin answer under the threshold fails open', async ($, on) => {
+test('a plugin answer under the threshold hides the listing, the guard on its old footing', async ($, on) => {
   answerSubmit(on)
   await start($, on, { mode: 'steer' }, { listing: PLUGGED, plugin: 'acs', pluginProbability: 0.1 })
   await $.prompt.submit({ text: 'find me a video about postgres' } as never)
   const attachment = await $.prompt.attachment({ type: 'skill_listing', text: PLUGGED } as never)
-  expect(attachment.text).toBe(PLUGGED)
+  expect(attachment.text).toBe(null)
   expect((await $.tool.call({ tool: 'Skill', skill: 'acs:search' })).deny).toMatch(/only the skill Jev picked/)
 })
 
-test('a plugin answer missing from the reply fails open', async ($, on) => {
+test('a plugin answer missing from the reply hides the listing, the guard on its old footing', async ($, on) => {
   answerSubmit(on)
   await start($, on, { mode: 'steer' }, { listing: PLUGGED, omitPluginAnswer: true })
   await $.prompt.submit({ text: 'find me a video about postgres' } as never)
   const attachment = await $.prompt.attachment({ type: 'skill_listing', text: PLUGGED } as never)
-  expect(attachment.text).toBe(PLUGGED)
+  expect(attachment.text).toBe(null)
   expect((await $.tool.call({ tool: 'Skill', skill: 'acs:search' })).deny).toMatch(/only the skill Jev picked/)
 })
 
-test('a roster with no plugins at all never narrows', async ($, on) => {
+test('a roster with no plugins at all hides the listing', async ($, on) => {
   answerSubmit(on)
   await start($, on, { mode: 'steer' })
   await $.prompt.submit({ text: 'find me a video about postgres' } as never)
   const attachment = await $.prompt.attachment({ type: 'skill_listing', text: LISTING } as never)
-  expect(attachment.text).toBe(LISTING)
+  expect(attachment.text).toBe(null)
 })
 
 test("steer loads a named plugin's sibling and refuses a skill outside it", async ($, on) => {

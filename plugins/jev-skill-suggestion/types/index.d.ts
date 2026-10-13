@@ -12,8 +12,8 @@ export type Verdict = {
   ranked: Ranked[]
   fits: Record<string, number>
   winner: string | null
-  // The plugin names Jev judged relevant to the request. Empty means "do not
-  // narrow": the listing stands and only the winner may load.
+  // The plugin names Jev judged relevant to the request. Empty means there is
+  // nothing to narrow to: the listing is hidden and only the winner may load.
   relevant: string[]
   ms: number
 }

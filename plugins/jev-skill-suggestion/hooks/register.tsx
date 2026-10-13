@@ -101,23 +101,39 @@ export function mergeRoster(disk: Skill[], listed: Skill[]): Skill[] {
   })
 }
 
-// The listing as the model reads it, with only the named plugins' entries left
-// in. Every non-entry line stays: the header, blank lines, and the continuation
-// lines of an entry that was kept. A dropped entry takes its own continuations
-// with it.
-export function narrowListing(text: string, relevant: readonly string[]): string {
-  const keep = new Set(relevant)
+// The listing as the model reads it, with the entries `keeps` admits left in
+// and every other entry dropped whole. Every non-entry line stays: the header,
+// blank lines, and the continuation lines of an entry that was kept. A dropped
+// entry takes its own continuations with it.
+function filterListing(text: string, keeps: (name: string) => boolean): string {
   const kept: string[] = []
   let state: 'kept' | 'dropped' | 'plain' = 'plain'
   for (const line of text.split('\n')) {
     // Read the entry's name the way parseListing does, so the set offered and
     // the set loadable agree entry for entry.
     const entry = line.match(/^- (\S+?)(?:: |$)/)
-    if (entry?.[1]) state = keep.has(pluginOf(entry[1].replace(/:$/, ''))) ? 'kept' : 'dropped'
+    if (entry?.[1]) state = keeps(entry[1].replace(/:$/, '')) ? 'kept' : 'dropped'
     else if (line.trim() === '') state = 'plain'
     if (state !== 'dropped') kept.push(line)
   }
   return kept.join('\n')
+}
+
+// Steer's listing: the named plugins' skills only, and never one the person has
+// turned off. That `off` set is the one the guard reads, so the listing cannot
+// offer what the guard would deny.
+export function narrowListing(
+  text: string,
+  relevant: readonly string[],
+  off: ReadonlySet<string>,
+): string {
+  const keep = new Set(relevant)
+  return filterListing(text, name => !off.has(name) && keep.has(pluginOf(name)))
+}
+
+// Observe's listing: every skill but the ones the person has turned off.
+function observeListing(text: string, off: ReadonlySet<string>): string {
+  return filterListing(text, name => !off.has(name))
 }
 
 export function gateOf(values: Record<string, number>): number {
@@ -192,8 +208,9 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
     wideQuestions[`gate::${key}`] = { type: 'noul', instructions }
   }
   const wide = await ask($, state, wideQuestions)
-  // Fail open: anything short of a confident pick of a known plugin leaves the
-  // listing alone and the guard on its old footing.
+  // Anything short of a confident pick of a known plugin leaves `relevant`
+  // empty: the listing is then hidden and the guard keeps its old footing, so
+  // only Jev's own pick may load.
   const pluginPick = wide.plugins?.choice
   const relevant =
     pluginPick && pluginPick !== NO_PLUGIN && plugins.includes(pluginPick) &&
@@ -248,7 +265,8 @@ const suggest = async ($: Engine, text: string): Promise<Verdict> => {
 
 // The plugins a listing may be narrowed to, as both the listing and the guard
 // read them: those of the last submitted prompt's own verdict, and nothing
-// otherwise. An empty answer always means "do not narrow".
+// otherwise. An empty answer is no plugin to narrow to: the listing is hidden
+// and the guard holds the model to Jev's pick.
 const narrowing = async ($: Engine): Promise<string[]> => {
   const result = await read($, verdict)
   if (!runtime.submitted || result?.text !== runtime.submitted) return []
@@ -373,28 +391,24 @@ export const register: Register = (on, options) => {
 
   // The listing the model reads: learn the roster from it, then narrow it to
   // Jev's plugins (steer), hide it (block) or drop the disabled skills
-  // (observe).
+  // (observe). No mode's listing offers a skill the person has turned off: one
+  // `off` set feeds both listings, the same set the guard denies against, so a
+  // listing never offers what the guard would turn away.
   on('prompt.attachment', { type: 'skill_listing' }, async ($, e, next) => {
     runtime.listed = parseListing(e.text)
     await update($, roster, () => mergeRoster(runtime.disk, runtime.listed))
     const current = await read($, mode)
+    const off = new Set(await read($, disabled))
     if (current === 'steer') {
       const relevant = await narrowing($)
-      // Fail open: no plugin named means the prompt stands as it did before.
-      if (relevant.length === 0) return next(e)
-      return next({ ...e, text: narrowListing(e.text, relevant) })
+      // Jev named no plugin, so there is nothing to narrow to: the listing is
+      // hidden, steer's old footing, with only Jev's pick left loadable.
+      if (relevant.length === 0) return { text: null }
+      return next({ ...e, text: narrowListing(e.text, relevant, off) })
     }
     if (current !== 'observe') return { text: null }
-    const off = new Set(await read($, disabled))
     if (off.size === 0) return next(e)
-    const kept = e.text
-      .split('\n')
-      .filter(line => {
-        const entry = line.match(/^- (\S+?)(?::|$)/)
-        return !entry?.[1] || !off.has(entry[1])
-      })
-      .join('\n')
-    return next({ ...e, text: kept })
+    return next({ ...e, text: observeListing(e.text, off) })
   })
 
   // The model's own skill loads: blocked outright, held to the steer pick,
@@ -458,9 +472,15 @@ export const register: Register = (on, options) => {
                       narrows to {result.relevant.join(', ')}
                       {result.winner ? ` (pick ${result.winner})` : ''}
                     </Text>
+                  ) : current === 'steer' ? (
+                    result.winner ? (
+                      <Text color="green">hides the listing · loads {result.winner}</Text>
+                    ) : (
+                      <Text dimColor>hides the listing · no skill</Text>
+                    )
                   ) : result.winner ? (
                     <Text color="green">
-                      {current === 'block' ? 'would load' : current === 'steer' ? 'loads' : 'pick'} {result.winner}
+                      {current === 'block' ? 'would load' : 'pick'} {result.winner}
                     </Text>
                   ) : (
                     <Text dimColor>no skill</Text>
@@ -513,7 +533,8 @@ export const register: Register = (on, options) => {
         </Box>
         <Text dimColor>
           observe: Claude picks as usual · block: no skill loads · steer: only the skills of the plugins Jev
-          names load, and only Jev's pick when it names none
+          names for this prompt may load, and only Jev's pick when it names none — the listing is narrowed to
+          those plugins, and hidden when Jev names none
         </Text>
         <Text dimColor>
           {skills.length} skills, {off.size} off{result ? ` · last: "${result.text.slice(0, 40)}"` : ''}
